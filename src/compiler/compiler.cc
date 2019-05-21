@@ -20,6 +20,7 @@
 #include "perfetto/rx_producer.h"  // TODO: refactor BinaryWireProtobuf to separate header.
 #include "inode2filename/inode.h"
 #include "inode2filename/search_directories.h"
+#include "serialize/protobuf_io.h"
 
 #include <android-base/unique_fd.h>
 #include <android-base/parseint.h>
@@ -312,9 +313,16 @@ auto /*observable<PageCacheFtraceEvent>*/ SelectPageCacheFtraceEvents(
             }
 
             if (timestamp < *timestamp_relative_start) {  // when DCHECK is disabled.
-              LOG(WARNING) << "FIXME: Ftrace timestamps must rise in value: "
-                           << "timestamp=" << timestamp << "ns, "
-                           << "timestamp_relative=" << *timestamp_relative_start << "ns";
+              static bool did_warn = false;
+
+              if (!did_warn) {
+                LOG(WARNING) << "FIXME: Ftrace timestamps must rise in value: "
+                            << "timestamp=" << timestamp << "ns, "
+                            << "timestamp_relative=" << *timestamp_relative_start << "ns";
+
+                // Super spammy warning, so throttle it for now.
+                did_warn = true;
+              }
 
               // avoid underflow
               timestamp_relative = 0;
@@ -391,22 +399,12 @@ auto /*observable<Inode*/ SelectDistinctInodesFromTraces(
 }
 // TODO: static assert checks for convertible return values.
 
-auto/*observable<InodeResult>*/ ResolveInodesToFileNames(rxcpp::observable<Inode> inodes) {
-  static auto* system_call = new SystemCallImpl{};
-  std::vector<std::string> root_directories;
-  root_directories.push_back("/system");
-  root_directories.push_back("/apex");
-  root_directories.push_back("/data");
-  root_directories.push_back("/vendor");
-  root_directories.push_back("/product");
-  root_directories.push_back("/metadata");
-  inode2filename::SearchMode search_mode{inode2filename::SearchMode::kInProcessDirect};
-  // TODO: above parameters should be injectable.
-
-  SearchDirectories search{borrowed<SystemCall*>(system_call)};
-  return search.FindFilenamesFromInodes(std::move(root_directories),
-                                        std::move(inodes),
-                                        search_mode);
+auto/*observable<InodeResult>*/ ResolveInodesToFileNames(
+    rxcpp::observable<Inode> inodes,
+    inode2filename::InodeResolverDependencies dependencies) {
+  std::shared_ptr<inode2filename::InodeResolver> inode_resolver =
+      inode2filename::InodeResolver::Create(std::move(dependencies));
+  return inode_resolver->FindFilenamesFromInodes(std::move(inodes));
 }
 
 using InodeMap = std::unordered_map<Inode, std::string /*filename*/>;
@@ -508,7 +506,8 @@ std::ostream& operator<<(std::ostream& os, const CombinedState& s) {
 }
 
 auto/*observable<ResolvedPageCacheFtraceEvent>*/ ResolvePageCacheEntriesFromProtos(
-    rxcpp::observable<ProtobufPtr<::perfetto::protos::Trace>> traces) {
+    rxcpp::observable<ProtobufPtr<::perfetto::protos::Trace>> traces,
+    inode2filename::InodeResolverDependencies dependencies) {
 
   // 1st chain = emits exactly 1 InodeMap.
 
@@ -516,7 +515,8 @@ auto/*observable<ResolvedPageCacheFtraceEvent>*/ ResolvePageCacheEntriesFromProt
   auto/*observable<Inode>*/ distinct_inodes = SelectDistinctInodesFromTraces(traces);
   rxcpp::observable<Inode> distinct_inodes_obs = distinct_inodes.as_dynamic();
   // [inode, inode, inode, ...] -> [(inode, {filename|error}), ...]
-  auto/*observable<InodeResult>*/ inode_names = ResolveInodesToFileNames(distinct_inodes_obs);
+  auto/*observable<InodeResult>*/ inode_names = ResolveInodesToFileNames(distinct_inodes_obs,
+                                                                         std::move(dependencies));
   // rxcpp has no 'join' operators, so do a manual join with concat.
   auto/*observable<InodeMap>*/ inode_name_map = ReduceResolvedInodesToMap(inode_names);
 
@@ -764,31 +764,84 @@ auto/*observable<CompilerPageCacheEvent>*/ CompilePageCacheEvents(
   );    // observable<CompilerPageCacheEvent>
 }
 
-bool PerformCompilation(std::vector<std::string> input_file_names, std::string output_file_name) {
+bool PerformCompilation(std::vector<std::string> input_file_names,
+                        std::string output_file_name,
+                        bool output_proto,
+                        inode2filename::InodeResolverDependencies dependencies) {
   auto trace_protos = ReadPerfettoTraceProtos(std::move(input_file_names));
-  auto resolved_events = ResolvePageCacheEntriesFromProtos(std::move(trace_protos));
+  auto resolved_events = ResolvePageCacheEntriesFromProtos(std::move(trace_protos),
+                                                           std::move(dependencies));
   auto compiled_events = CompilePageCacheEvents(std::move(resolved_events));
-
-  // TODO: write to a file, instead of to stdout.
-  (void)output_file_name;
 
   std::ofstream ofs;
   if (!output_file_name.empty()) {
-    ofs.open(output_file_name);
 
-    if (!ofs) {
-      LOG(ERROR) << "compiler: Failed to open output file for writing: " << output_file_name;
-      return false;
+    if (!output_proto) {
+      ofs.open(output_file_name);
+
+      if (!ofs) {
+        LOG(ERROR) << "compiler: Failed to open output file for writing: " << output_file_name;
+        return false;
+      }
     }
   }
 
-  static bool constexpr kOutputResults = true;
+  auto trace_file_proto = serialize::ArenaPtr<serialize::proto::TraceFile>::Make();
+
+  // Fast lookup of filename -> FileIndex id.
+  std::unordered_map<std::string, int64_t /*file handle id*/> file_path_map;
+  int64_t file_handle_id = 0;
 
   int counter = 0;
   compiled_events
     // .as_blocking()
+    .tap([&](CompilerPageCacheEvent& event) {
+      if (!output_proto) {
+        return;
+      }
+
+      if (!event.add_to_page_cache) {
+        // Skip DeleteFromPageCache events, they are only used for intermediate.
+        return;
+      }
+
+      DCHECK(trace_file_proto->mutable_index() != nullptr);
+      serialize::proto::TraceFileIndex& index = *trace_file_proto->mutable_index();
+      int64_t file_handle;
+
+      // Add TraceFileIndexEntry if it doesn't exist.
+
+      auto it = file_path_map.find(event.filename);
+      if (it == file_path_map.end()) {
+        file_handle = file_handle_id++;
+        file_path_map[event.filename] = file_handle;
+
+        serialize::proto::TraceFileIndexEntry* entry = index.add_entries();
+        DCHECK(entry != nullptr);
+        entry->set_id(file_handle);
+        entry->set_file_name(event.filename);
+
+        if (kIsDebugBuild) {
+          int i = static_cast<int>(file_handle);
+          const serialize::proto::TraceFileIndexEntry& entry_ex = index.entries(i);
+          DCHECK_EQ(entry->id(), entry_ex.id());
+          DCHECK_EQ(entry->file_name(), entry_ex.file_name());
+        }
+      } else {
+        file_handle = it->second;
+      }
+
+      // Add TraceFileEntry.
+      DCHECK(trace_file_proto->mutable_list() != nullptr);
+      serialize::proto::TraceFileEntry* entry = trace_file_proto->mutable_list()->add_entries();
+      DCHECK(entry != nullptr);
+
+      entry->set_index_id(file_handle);
+      entry->set_file_offset(static_cast<int64_t>(event.index));
+      entry->set_file_length(4096);  // TODO: don't hardcode the page size.
+    })
     .subscribe([&](CompilerPageCacheEvent event) {
-      if (kOutputResults) {
+      if (!output_proto) {
         if (output_file_name.empty()) {
           LOG(INFO) << "CompilerPageCacheEvent" << event << std::endl;
         } else {
@@ -797,6 +850,18 @@ bool PerformCompilation(std::vector<std::string> input_file_names, std::string o
       }
       ++counter;
     });
+
+  if (output_proto) {
+    LOG(DEBUG) << "compiler: WriteFully to begin into " << output_file_name;
+    ::google::protobuf::MessageLite& message = *trace_file_proto.get();
+    if (auto res = serialize::ProtobufIO::WriteFully(message, output_file_name); !res) {
+      errno = res.error();
+      PLOG(ERROR) << "compiler: Failed to write protobuf to file: " << output_file_name;
+      return false;
+    } else {
+      LOG(INFO) << "compiler: Wrote protobuf " << output_file_name;
+    }
+  }
 
   LOG(DEBUG) << "compiler: Compilation completed (" << counter << " events).";
 

@@ -304,8 +304,9 @@ cc_defaults {
 
     defaults: [
         // use the perfetto namespace
-        "libiorap-perfetto-default-dependencies"
+        "libiorap-perfetto-default-dependencies",
         // use the inode2filename namespace
+        "libiorap-serialize-default-dependencies",  // uses but does not re-export serialize.
     ],
 
     // Some of the libperfetto header typedefs leak out into iorap.
@@ -321,6 +322,7 @@ cc_defaults {
         "libiorap-perfetto",
         // "perfetto_trace_protos",
         "libiorap-inode2filename",
+        "libiorap-serialize",
     ],
 
     shared_libs: [
@@ -375,4 +377,37 @@ cc_binary {
 
   static_libs: [
   ],
+}
+
+// Static libraries cannot export their dependencies,
+// the current convention is to use an extra 'defaults' rule for statics
+// to bring in all the dependencies.
+cc_defaults {
+    name: "libiorap-serialize-default-dependencies",
+
+    defaults: [
+    ],
+
+    include_dirs: [],
+    static_libs: [
+    ],
+    shared_libs: [
+    ],
+    // Above intentionally left empty.
+    srcs: [
+        "src/serialize/**/*.proto",
+    ],
+}
+
+cc_library_static {
+    name: "libiorap-serialize",
+    defaults: [
+        "iorap-default-flags",
+        "iorap-default-dependencies",
+        "libiorap-serialize-default-dependencies",
+    ],
+
+    srcs: [
+        "src/serialize/**/*.cc",
+    ],
 }
