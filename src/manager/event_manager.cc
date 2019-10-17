@@ -89,6 +89,30 @@ struct AppComponentName {
     return s;
   }
 
+  /*
+   * '/' is encoded into @@
+   * '%' is encoded into ^^
+   *
+   * Two purpose:
+   * 1. This allows the pacakge name to be used as a file name
+   * ('/' is illegal due to being a path separator) with minimal
+   * munging.
+   * 2. This allows the package name to be used in .mk file because
+   * '%' is a special char and cannot be easily escaped in Makefile.
+   *
+   * This is a workround for test purpose.
+   * Only package name is used because activity name varies on
+   * diffferent testing framework.
+   * Hopefully, the double "@@" and "^^" are not used in other cases.
+   */
+  // {"com.foo.bar", ".A%"} -> "com.foo.bar"
+  std::string ToMakeFileSafeEncodedPkgString() const {
+    std::string s = package;
+    Replace(s, "/", "@@");
+    Replace(s, "%", "^^");
+    return s;
+  }
+
  private:
   static bool Replace(std::string& str, const std::string& from, const std::string& to) {
     // TODO: call in a loop to replace all occurrences, not just the first one.
@@ -121,7 +145,9 @@ struct AppLaunchEventState {
   // but changes whenever a new app launch sequence begins.
   size_t sequence_id_ = static_cast<size_t>(-1);
 
-  prefetcher::ReadAhead read_ahead_;
+  // labeled as 'shared' due to rx not being able to handle move-only objects.
+  // lifetime: in practice equivalent to unique_ptr.
+  std::shared_ptr<prefetcher::ReadAhead> read_ahead_;
   bool allowed_readahead_{true};
   bool is_read_ahead_{false};
   std::optional<prefetcher::TaskId> read_ahead_task_;
@@ -139,7 +165,9 @@ struct AppLaunchEventState {
                                bool allowed_readahead,
                                bool allowed_tracing,
                                borrowed<observe_on_one_worker*> thread,
-                               borrowed<observe_on_one_worker*> io_thread) {
+                               borrowed<observe_on_one_worker*> io_thread)
+    : read_ahead_{std::make_shared<prefetcher::ReadAhead>()}
+  {
     perfetto_factory_ = perfetto_factory;
     DCHECK(perfetto_factory_ != nullptr);
 
@@ -277,12 +305,14 @@ struct AppLaunchEventState {
     DCHECK(allowed_readahead_);
     DCHECK(!IsReadAhead());
 
-    std::string file_path = "/system/iorap-trace/";
-    file_path += component_name.ToUrlEncodedString();
+    // This is changed from "/data/misc/iorapd/" for testing purpose.
+    // TODO: b/139831359.
+    std::string file_path = "/product/iorap-trace/";
+    file_path += component_name.ToMakeFileSafeEncodedPkgString();
     file_path += ".compiled_trace.pb";
 
     prefetcher::TaskId task{id, std::move(file_path)};
-    read_ahead_.BeginTask(task);
+    read_ahead_->BeginTask(task);
     // TODO: non-void return signature?
 
     read_ahead_task_ = std::move(task);
@@ -291,7 +321,7 @@ struct AppLaunchEventState {
   void FinishReadAhead() {
     DCHECK(IsReadAhead());
 
-    read_ahead_.FinishTask(*read_ahead_task_);
+    read_ahead_->FinishTask(*read_ahead_task_);
     read_ahead_task_ = std::nullopt;
   }
 
