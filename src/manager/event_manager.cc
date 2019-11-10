@@ -16,6 +16,10 @@
 
 #include "common/debug.h"
 #include "common/expected.h"
+#include "common/rx_async.h"
+#include "db/app_component_name.h"
+#include "db/file_models.h"
+#include "db/models.h"
 #include "manager/event_manager.h"
 #include "perfetto/rx_producer.h"
 #include "prefetcher/read_ahead.h"
@@ -26,6 +30,7 @@
 
 #include <atomic>
 #include <functional>
+#include <utils/Trace.h>
 
 using rxcpp::observe_on_one_worker;
 
@@ -36,101 +41,13 @@ using binder::JobScheduledEvent;
 using binder::RequestId;
 using binder::TaskResult;
 
+using common::AsyncPool;
+using common::RxAsync;
+
 using perfetto::PerfettoStreamCommand;
 using perfetto::PerfettoTraceProto;
 
-struct AppComponentName {
-  std::string package;
-  std::string activity_name;
-
-  static bool HasAppComponentName(const std::string& s) {
-    return s.find('/') != std::string::npos;
-  }
-
-  // "com.foo.bar/.A" -> {"com.foo.bar", ".A"}
-  static AppComponentName FromString(const std::string& s) {
-    constexpr const char delimiter = '/';
-    std::string package = s.substr(0, delimiter);
-
-    std::string activity_name = s;
-    activity_name.erase(0, s.find(delimiter) + sizeof(delimiter));
-
-    return {std::move(package), std::move(activity_name)};
-  }
-
-  // {"com.foo.bar", ".A"} -> "com.foo.bar/.A"
-  std::string ToString() const {
-    return package + "/" + activity_name;
-  }
-
-  /*
-   * '/' is encoded into %2F
-   * '%' is encoded into %25
-   *
-   * This allows the component name to be be used as a file name
-   * ('/' is illegal due to being a path separator) with minimal
-   * munging.
-   */
-
-  // "com.foo.bar%2F.A%25" -> {"com.foo.bar", ".A%"}
-  static AppComponentName FromUrlEncodedString(const std::string& s) {
-    std::string cpy = s;
-    Replace(cpy, "%2F", "/");
-    Replace(cpy, "%25", "%");
-
-    return FromString(cpy);
-  }
-
-  // {"com.foo.bar", ".A%"} -> "com.foo.bar%2F.A%25"
-  std::string ToUrlEncodedString() const {
-    std::string s = ToString();
-    Replace(s, "%", "%25");
-    Replace(s, "/", "%2F");
-    return s;
-  }
-
-  /*
-   * '/' is encoded into @@
-   * '%' is encoded into ^^
-   *
-   * Two purpose:
-   * 1. This allows the pacakge name to be used as a file name
-   * ('/' is illegal due to being a path separator) with minimal
-   * munging.
-   * 2. This allows the package name to be used in .mk file because
-   * '%' is a special char and cannot be easily escaped in Makefile.
-   *
-   * This is a workround for test purpose.
-   * Only package name is used because activity name varies on
-   * diffferent testing framework.
-   * Hopefully, the double "@@" and "^^" are not used in other cases.
-   */
-  // {"com.foo.bar", ".A%"} -> "com.foo.bar"
-  std::string ToMakeFileSafeEncodedPkgString() const {
-    std::string s = package;
-    Replace(s, "/", "@@");
-    Replace(s, "%", "^^");
-    return s;
-  }
-
- private:
-  static bool Replace(std::string& str, const std::string& from, const std::string& to) {
-    // TODO: call in a loop to replace all occurrences, not just the first one.
-    const size_t start_pos = str.find(from);
-    if (start_pos == std::string::npos) {
-      return false;
-    }
-
-    str.replace(start_pos, from.length(), to);
-
-    return true;
-}
-};
-
-std::ostream& operator<<(std::ostream& os, const AppComponentName& name) {
-  os << name.ToString();
-  return os;
-}
+using db::AppComponentName;
 
 // Main logic of the #OnAppLaunchEvent scan method.
 //
@@ -144,6 +61,12 @@ struct AppLaunchEventState {
   // Sequence ID is shared amongst the same app launch sequence,
   // but changes whenever a new app launch sequence begins.
   size_t sequence_id_ = static_cast<size_t>(-1);
+  std::optional<AppLaunchEvent::Temperature> temperature_;
+
+  // Push data to perfetto rx chain for associating
+  // the raw_trace with the history_id.
+  std::optional<rxcpp::subscriber<int>> history_id_subscriber_;
+  rxcpp::observable<int> history_id_observable_;
 
   // labeled as 'shared' due to rx not being able to handle move-only objects.
   // lifetime: in practice equivalent to unique_ptr.
@@ -160,12 +83,14 @@ struct AppLaunchEventState {
   borrowed<perfetto::RxProducerFactory*> perfetto_factory_;  // not null
   borrowed<observe_on_one_worker*> thread_;  // not null
   borrowed<observe_on_one_worker*> io_thread_;  // not null
+  borrowed<AsyncPool*> async_pool_;  // not null
 
   explicit AppLaunchEventState(borrowed<perfetto::RxProducerFactory*> perfetto_factory,
                                bool allowed_readahead,
                                bool allowed_tracing,
                                borrowed<observe_on_one_worker*> thread,
-                               borrowed<observe_on_one_worker*> io_thread)
+                               borrowed<observe_on_one_worker*> io_thread,
+                               borrowed<AsyncPool*> async_pool)
     : read_ahead_{std::make_shared<prefetcher::ReadAhead>()}
   {
     perfetto_factory_ = perfetto_factory;
@@ -179,6 +104,9 @@ struct AppLaunchEventState {
 
     io_thread_ = io_thread;
     DCHECK(io_thread_ != nullptr);
+
+    async_pool_ = async_pool;
+    DCHECK(async_pool_ != nullptr);
   }
 
   // Updates the values in this struct only as a side effect.
@@ -188,6 +116,9 @@ struct AppLaunchEventState {
   void OnNewEvent(const AppLaunchEvent& event) {
     LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: " << event;
 
+    android::ScopedTrace trace_db_init{ATRACE_TAG_PACKAGE_MANAGER,
+                                       "IorapNativeService::OnAppLaunchEvent"};
+
     using Type = AppLaunchEvent::Type;
 
     DCHECK_GE(event.sequence_id, 0);
@@ -195,6 +126,20 @@ struct AppLaunchEventState {
 
     switch (event.type) {
       case Type::kIntentStarted: {
+        // Create a new history ID chain for each new app start-up sequence.
+        auto history_id_observable = rxcpp::observable<>::create<int>(
+          [&](rxcpp::subscriber<int> subscriber) {
+            history_id_subscriber_ = std::move(subscriber);
+            LOG(VERBOSE) << " set up the history id subscriber ";
+          })
+          .tap([](int history_id) { LOG(VERBOSE) << " tap rx history id = " << history_id; })
+          .replay(1);  // Remember the history id in case we subscribe too late.
+
+        history_id_observable_ = history_id_observable;
+
+        // Immediately turn observable hot, creating the subscriber.
+        history_id_observable.connect();
+
         DCHECK(!IsTracing());
         // Optimistically start tracing if we have the activity in the intent.
         if (!event.intent_proto->has_component()) {
@@ -219,22 +164,26 @@ struct AppLaunchEventState {
         break;
       }
       case Type::kIntentFailed:
-        if (allowed_tracing_) {
-            AbortTrace();
-        }
+        AbortTrace();
         AbortReadAhead();
+
+        if (history_id_subscriber_) {
+          history_id_subscriber_->on_error(rxcpp::util::make_error_ptr(
+            std::ios_base::failure("Aborting due to intent failed")));
+          history_id_subscriber_ = std::nullopt;
+        }
+
         break;
       case Type::kActivityLaunched: {
         // Cancel tracing for warm/hot.
         // Restart tracing if the activity was unexpected.
 
         AppLaunchEvent::Temperature temperature = event.temperature;
+        temperature_ = temperature;
         if (temperature != AppLaunchEvent::Temperature::kCold) {
           LOG(DEBUG) << "AppLaunchEventState#OnNewEvent aborting trace due to non-cold temperature";
 
-          if (allowed_tracing_) {
-            AbortTrace();
-          }
+          AbortTrace();
           AbortReadAhead();
         } else if (!IsTracing() || !IsReadAhead()) {  // and the temperature is Cold.
           // Start late trace when intent didn't have a component name
@@ -270,6 +219,7 @@ struct AppLaunchEventState {
         break;
       }
       case Type::kActivityLaunchFinished:
+        RecordDbLaunchHistory();
         // Finish tracing and collect trace buffer.
         //
         // TODO: this happens automatically when perfetto finishes its
@@ -277,18 +227,15 @@ struct AppLaunchEventState {
         if (IsTracing()) {
           MarkPendingTrace();
         }
-        if (IsReadAhead()) {
-          FinishReadAhead();
-        }
+        FinishReadAhead();
         break;
       case Type::kActivityLaunchCancelled:
         // Abort tracing.
-        if (allowed_tracing_) {
-          AbortTrace();
-        }
-        if (IsReadAhead()) {
-          AbortReadAhead();
-        }
+        AbortTrace();
+        AbortReadAhead();
+        break;
+      case Type::kReportFullyDrawn:
+        // TODO(yawanng) add handling of this event.
         break;
       default:
         DCHECK(false) << "invalid type: " << event;  // binder layer should've rejected this.
@@ -319,7 +266,10 @@ struct AppLaunchEventState {
   }
 
   void FinishReadAhead() {
-    DCHECK(IsReadAhead());
+    // if no readahead task exist, do nothing.
+    if (!IsReadAhead()){
+      return;
+    }
 
     read_ahead_->FinishTask(*read_ahead_task_);
     read_ahead_task_ = std::nullopt;
@@ -359,30 +309,55 @@ struct AppLaunchEventState {
 
     rxcpp::composite_subscription lifetime;
 
-    trace_proto_stream
+    auto stream_via_threads = trace_proto_stream
       .tap([](const PerfettoTraceProto& trace_proto) {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (1)";
            })
+      .combine_latest(history_id_observable_)
       .observe_on(*thread_)   // All work prior to 'observe_on' is handled on thread_.
       .subscribe_on(*thread_)   // All work prior to 'observe_on' is handled on thread_.
       .observe_on(*io_thread_)  // Write data on an idle-class-priority thread.
-      .tap([](const PerfettoTraceProto& trace_proto) {
+      .tap([](std::tuple<PerfettoTraceProto, int> trace_tuple) {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (2)";
-           })
-      .as_blocking()  // TODO: remove.
-      .subscribe(/*out*/lifetime,
-        /*on_next*/[component_name]
-        (PerfettoTraceProto trace_proto) {
-          std::string file_path = "/data/misc/iorapd/";
-          file_path += component_name.ToUrlEncodedString();
-          file_path += ".perfetto_trace.pb";
+           });
 
-          // TODO: timestamp each file into a subdirectory.
+    db::VersionedComponentName versioned_component_name{component_name.package,
+                                                        component_name.activity_name,
+                                                        /*version*/std::nullopt};  // TODO: version
+    lifetime = RxAsync::SubscribeAsync(*async_pool_,
+        std::move(stream_via_threads),
+        /*on_next*/[versioned_component_name]
+        (std::tuple<PerfettoTraceProto, int> trace_tuple) {
+          PerfettoTraceProto& trace_proto = std::get<0>(trace_tuple);
+          int history_id = std::get<1>(trace_tuple);
+
+          db::PerfettoTraceFileModel file_model =
+            db::PerfettoTraceFileModel::CalculateNewestFilePath(versioned_component_name);
+
+          std::string file_path = file_model.FilePath();
+
+          if (!file_model.MkdirWithParents()) {
+            LOG(ERROR) << "Cannot save TraceBuffer; failed to mkdirs " << file_path;
+            return;
+          }
 
           if (!trace_proto.WriteFullyToFile(file_path)) {
             LOG(ERROR) << "Failed to save TraceBuffer to " << file_path;
           } else {
             LOG(INFO) << "Perfetto TraceBuffer saved to file: " << file_path;
+
+            db::DbHandle db{db::SchemaModel::GetSingleton()};
+            std::optional<db::RawTraceModel> raw_trace =
+                db::RawTraceModel::Insert(db, history_id, file_path);
+
+            if (!raw_trace) {
+              LOG(ERROR) << "Failed to insert raw_traces for " << file_path;
+            } else {
+              LOG(VERBOSE) << "Inserted into db: " << *raw_trace;
+
+              // Ensure we don't have too many files per-app.
+              db::PerfettoTraceFileModel::DeleteOlderFiles(db, versioned_component_name);
+            }
           }
         },
         /*on_error*/[](rxcpp::util::error_ptr err) {
@@ -398,12 +373,22 @@ struct AppLaunchEventState {
     LOG(VERBOSE) << "AppLaunchEventState - AbortTrace";
     DCHECK(allowed_tracing_);
 
+    // if the tracing is not running, do nothing.
+    if (!IsTracing()){
+      return;
+    }
+
     is_tracing_ = false;
     if (rx_lifetime_) {
       // TODO: it would be good to call perfetto Destroy.
 
+      std::remove(rx_in_flight_.begin(),
+                  rx_in_flight_.end(),
+                  *rx_lifetime_);
+
       LOG(VERBOSE) << "AppLaunchEventState - AbortTrace - Unsubscribe";
       rx_lifetime_->unsubscribe();
+
       rx_lifetime_.reset();
     }
   }
@@ -427,6 +412,71 @@ struct AppLaunchEventState {
     }
 
     // FIXME: how do we clear this vector?
+  }
+
+  void RecordDbLaunchHistory() {
+    std::optional<db::AppLaunchHistoryModel> history = InsertDbLaunchHistory();
+
+    // RecordDbLaunchHistory happens-after kIntentStarted
+    CHECK(history_id_subscriber_.has_value()) << "Logic error? "
+                                              << "Should always have a subscriber here.";
+
+    // Ensure that the history id rx chain is terminated either with an error or with
+    // the newly inserted app_launch_histories.id
+    if (!history) {
+      history_id_subscriber_->on_error(rxcpp::util::make_error_ptr(
+          std::ios_base::failure("Failed to insert history id")));
+    } else {
+      // Note: we must have already subscribed, or this value will disappear.
+      LOG(VERBOSE) << "history_id_subscriber on_next history_id=" << history->id;
+      history_id_subscriber_->on_next(history->id);
+      history_id_subscriber_->on_completed();
+    }
+    history_id_subscriber_ = std::nullopt;
+  }
+
+  std::optional<db::AppLaunchHistoryModel> InsertDbLaunchHistory() {
+    // TODO: deferred queue into a different lower priority thread.
+    if (!component_name_ || !temperature_) {
+      LOG(VERBOSE) << "Skip RecordDbLaunchHistory, no component name available.";
+
+      return std::nullopt;
+    }
+
+    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+                               "IorapNativeService::RecordDbLaunchHistory"};
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+
+    using namespace iorap::db;
+
+    std::optional<ActivityModel> activity =
+        ActivityModel::SelectOrInsert(db,
+                                      component_name_->package,
+                                      /*version*/std::nullopt,
+                                      component_name_->activity_name);
+
+    if (!activity) {
+      LOG(WARNING) << "Failed to query activity row for : " << *component_name_;
+      return std::nullopt;
+    }
+
+    auto temp = static_cast<db::AppLaunchHistoryModel::Temperature>(*temperature_);
+
+    std::optional<AppLaunchHistoryModel> alh =
+        AppLaunchHistoryModel::Insert(db,
+                                      activity->id,
+                                      temp,
+                                      IsTracing(),
+                                      IsReadAhead(),
+                                      /*total_time_ns*/std::nullopt,
+                                      /*report_fully_drawn_ns*/std::nullopt);
+    if (!alh) {
+      LOG(WARNING) << "Failed to insert app_launch_histories row";
+      return std::nullopt;
+    }
+
+    LOG(VERBOSE) << "RecordDbLaunchHistory: " << *alh;
+    return alh;
   }
 };
 
@@ -581,6 +631,10 @@ class EventManager::Impl {
     callbacks_ = callbacks;
   }
 
+  void Join() {
+    async_pool_.Join();
+  }
+
   bool OnAppLaunchEvent(RequestId request_id,
                         const AppLaunchEvent& event) {
     LOG(VERBOSE) << "EventManager::OnAppLaunchEvent("
@@ -623,7 +677,8 @@ class EventManager::Impl {
                                       readahead_allowed_,
                                       tracing_allowed_,
                                       &worker_thread2_,
-                                      &io_thread_};
+                                      &io_thread_,
+                                      &async_pool_};
     app_launch_events_
       .subscribe_on(worker_thread_)
       .scan(std::move(initial_state),
@@ -741,6 +796,8 @@ class EventManager::Impl {
   observe_on_one_worker worker_thread2_;
   // low priority idle-class thread for IO operations.
   observe_on_one_worker io_thread_;
+  // async futures pool for async rx operations.
+  AsyncPool async_pool_;
 
   rxcpp::composite_subscription rx_lifetime_;  // app launch events
   rxcpp::composite_subscription rx_lifetime_jobs_;  // job scheduled events
@@ -776,6 +833,10 @@ std::shared_ptr<EventManager> EventManager::Create(perfetto::RxProducerFactory& 
 
 void EventManager::SetTaskResultCallbacks(std::shared_ptr<TaskResultCallbacks> callbacks) {
   return impl_->SetTaskResultCallbacks(std::move(callbacks));
+}
+
+void EventManager::Join() {
+  return impl_->Join();
 }
 
 bool EventManager::OnAppLaunchEvent(RequestId request_id,

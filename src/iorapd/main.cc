@@ -17,6 +17,7 @@
 #include "binder/iiorap_impl.h"
 #include "common/debug.h"
 #include "common/loggers.h"
+#include "db/models.h"
 #include "manager/event_manager.h"
 
 #include <android-base/logging.h>
@@ -37,21 +38,30 @@ int main(int /*argc*/, char** argv) {
   // Logs go to system logcat.
   android::base::InitLogging(argv, iorap::common::StderrAndLogdLogger{android::base::SYSTEM});
 
+  LOG(INFO) << kServiceName << " (the prefetchening) firing up";
   {
-    android::ScopedTrace trace_main{ATRACE_TAG_PACKAGE_MANAGER, "main"};
-    LOG(INFO) << kServiceName << " (the prefetchening) firing up";
+    android::ScopedTrace trace_db_init{ATRACE_TAG_PACKAGE_MANAGER, "IorapNativeService::db_init"};
+    iorap::db::SchemaModel db_schema =
+        iorap::db::SchemaModel::GetOrCreate(
+            android::base::GetProperty("iorapd.db.location",
+                                       "/data/misc/iorapd/sqlite.db"));
+    db_schema.MarkSingleton();
+  }
 
+  std::shared_ptr<iorap::manager::EventManager> event_manager;
+  {
     android::ScopedTrace trace_start{ATRACE_TAG_PACKAGE_MANAGER, "IorapNativeService::start"};
 
     // TODO: use fruit for this DI.
-    auto /*std::shared_ptr<EventManager>*/ event_manager =
+    event_manager =
         iorap::manager::EventManager::Create();
-    if (!iorap::binder::IIorapImpl::Start(std::move(event_manager))) {
+    if (!iorap::binder::IIorapImpl::Start(event_manager)) {
       LOG(ERROR) << "Unable to start IorapNativeService";
       exit(1);
     }
   }
 
+  event_manager->Join();  // TODO: shutdown somewhere?
   // Block until something else shuts down the binder service.
   android::IPCThreadState::self()->joinThreadPool();
   LOG(INFO) << kServiceName << " shutting down";
