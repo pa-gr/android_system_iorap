@@ -57,8 +57,10 @@ TEST_F(CompilerTest, SingleTraceDuration) {
   char* output_file_name = tmp_file.path;
   bool output_proto = false;
 
-  bool result = PerformCompilation(input_file_names,
-                                   timestamp_limit_ns,
+
+  std::vector<CompilationInput> perfetto_traces =
+      MakeCompilationInputs(input_file_names, timestamp_limit_ns);
+  bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
                                    ir_dependencies);
@@ -72,7 +74,7 @@ TEST_F(CompilerTest, SingleTraceDuration) {
   EXPECT_EQ(result, true);
   EXPECT_EQ(content, "{filename:\"/product/app/CalculatorGooglePrebuilt/"
             "CalculatorGooglePrebuilt.apk\","
-            "timestamp:260390390001566,"
+            "timestamp:7641303,"
             "add_to_page_cache:1,"
             "index:540}\n");
 }
@@ -85,8 +87,9 @@ TEST_F(CompilerTest, MultiTraceDuration) {
   char* output_file_name = tmp_file.path;
   bool output_proto = false;
 
-  bool result = PerformCompilation(input_file_names,
-                                   timestamp_limit_ns,
+  std::vector<CompilationInput> perfetto_traces =
+      MakeCompilationInputs(input_file_names, timestamp_limit_ns);
+  bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
                                    ir_dependencies);
@@ -95,15 +98,15 @@ TEST_F(CompilerTest, MultiTraceDuration) {
     std::istreambuf_iterator<char>()};
 
   EXPECT_EQ(result, true);
-  EXPECT_EQ(content, "{filename:\"/product/app/CalculatorGooglePrebuilt/"
+  EXPECT_EQ(content, "{filename:\"/apex/com.android.art/lib64/libperfetto_hprof.so\","
+            "timestamp:4388958,"
+            "add_to_page_cache:1,"
+            "index:227}\n"
+            "{filename:\"/product/app/CalculatorGooglePrebuilt/"
             "CalculatorGooglePrebuilt.apk\","
-            "timestamp:260390390001566,"
+            "timestamp:7641303,"
             "add_to_page_cache:1,"
-            "index:540}\n"
-            "{filename:\"/apex/com.android.art/lib64/libperfetto_hprof.so\","
-            "timestamp:333215840452006,"
-            "add_to_page_cache:1,"
-            "index:227}\n");
+            "index:540}\n");
 }
 
 TEST_F(CompilerTest, NoTraceDuration) {
@@ -112,8 +115,9 @@ TEST_F(CompilerTest, NoTraceDuration) {
   char* output_file_name = tmp_file.path;
   bool output_proto = false;
 
-  bool result = PerformCompilation(input_file_names,
-                                   /* timestamp_limit_ns= */{},
+  std::vector<CompilationInput> perfetto_traces =
+      MakeCompilationInputs(input_file_names, /* timestamp_limit_ns= */{});
+  bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
                                    ir_dependencies);
