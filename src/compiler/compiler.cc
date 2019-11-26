@@ -71,16 +71,6 @@ struct PerfettoTracePtrInfo {
   uint64_t timestamp_limit_ns;
 };
 
-struct  PerfettoTraceFileInfo {
-  /* The name of the perfetto trace. */
-  std::string filename;
-  /*
-   * The timestamp limit of the trace.
-   * It's used to truncate the trace file.
-   */
-  uint64_t timestamp_limit_ns;
-};
-
 // Attempt to read protobufs from the filenames.
 // Emits one (or none) protobuf for each filename, in the same order as the filenames.
 // On any errors, the items are dropped (errors are written to the error LOG).
@@ -88,11 +78,11 @@ struct  PerfettoTraceFileInfo {
 // All work is done on the same Coordinator as the Subscriber.
 template <typename ProtoT /*extends MessageLite*/>
 auto/*observable<PerfettoTracePtrInfo>*/ ReadProtosFromFileNames(
-    rxcpp::observable<PerfettoTraceFileInfo> file_infos) {
+    rxcpp::observable<CompilationInput> file_infos) {
   using BinaryWireProtoT = ::iorap::perfetto::PerfettoTraceProto;
 
   return file_infos
-    .map([](const PerfettoTraceFileInfo& file_info) ->
+    .map([](const CompilationInput& file_info) ->
          std::optional<PerfettoTraceProtoInfo> {
       LOG(VERBOSE) << "compiler::ReadProtosFromFileNames " << file_info.filename
                    << " TimeStampLimit "<< file_info.timestamp_limit_ns << " [begin]";
@@ -168,7 +158,7 @@ auto/*observable<PerfettoTracePtrInfo>*/ ReadProtosFromFileNames(
 }
 
 auto/*observable<PerfettoTracePtrInfo>*/ ReadPerfettoTraceProtos(
-    std::vector<PerfettoTraceFileInfo> file_infos) {
+    std::vector<CompilationInput> file_infos) {
   auto filename_obs = rxcpp::observable<>::iterate(std::move(file_infos));
   rxcpp::observable<PerfettoTracePtrInfo> obs =
       ReadProtosFromFileNames<::perfetto::protos::Trace>(std::move(filename_obs));
@@ -241,6 +231,34 @@ std::ostream& operator<<(std::ostream& os, const PageCacheFtraceEvent& e) {
 }
 
 /*
+ * Gets the start timestamp.
+ *
+ * It is the minimium timestamp.
+ */
+std::optional<uint64_t> GetStartTimestamp(const ::perfetto::protos::Trace& trace) {
+  std::optional<uint64_t> timestamp_relative_start;
+  // Traverse each timestamp to get the minimium one.
+  for (const ::perfetto::protos::TracePacket& packet : trace.packet()) {
+    if (packet.has_timestamp()) {
+      timestamp_relative_start = timestamp_relative_start?
+          std::min(*timestamp_relative_start, packet.timestamp()) : packet.timestamp();
+    }
+    if (!packet.has_ftrace_events()) {
+      continue;
+    }
+    const ::perfetto::protos::FtraceEventBundle& ftrace_event_bundle =
+        packet.ftrace_events();
+    for (const ::perfetto::protos::FtraceEvent& event : ftrace_event_bundle.event()) {
+      if (event.has_timestamp()) {
+        timestamp_relative_start = timestamp_relative_start?
+            std::min(*timestamp_relative_start, event.timestamp()) : event.timestamp();
+      }
+    }
+  }
+  return timestamp_relative_start;
+}
+
+/*
  * sample blueline output:
  *
  * $ adb shell cat /d/tracing/events/filemap/mm_filemap_add_to_page_cache/format
@@ -277,7 +295,7 @@ auto /*observable<PageCacheFtraceEvent>*/ SelectPageCacheFtraceEvents(
     uint64_t timestamp = 0;
     uint64_t timestamp_relative = 0;
 
-    std::optional<uint64_t> timestamp_relative_start;
+    std::optional<uint64_t> timestamp_relative_start = GetStartTimestamp(trace);
     uint32_t cpu = 0;
     uint32_t pid = 0;
     bool add_to_page_cache = true;
@@ -329,7 +347,6 @@ auto /*observable<PageCacheFtraceEvent>*/ SelectPageCacheFtraceEvents(
           }
 
           if (event.has_timestamp()) {
-            timestamp_relative_start = timestamp_relative_start.value_or(event.timestamp());
             timestamp = event.timestamp();
             if(timestamp > timestamp_limit_ns) {
               LOG(VERBOSE) << "The timestamp is " << timestamp <<
@@ -344,44 +361,10 @@ auto /*observable<PageCacheFtraceEvent>*/ SelectPageCacheFtraceEvents(
             // is the packet data going to be the same clock sample as the Ftrace event?
           }
 
-          if (timestamp_relative_start) {
-            // Otherwise this assumption is incorrect and we need an extra pass
-            // to determine the minimum timestamp in a trace.
-
-            // FIXME: handle this case:
-            if ((false)) {
-              DCHECK_GE(timestamp, *timestamp_relative_start)
-                  << "Ftrace timestamps must rise in value";
-              // TODO: if this fails, we can probably just do this in separate functions?
-              // this function is already becoming quite large.
-            }
-
-            if (timestamp < *timestamp_relative_start) {  // when DCHECK is disabled.
-              static bool did_warn = false;
-
-              if (!did_warn) {
-                LOG(WARNING) << "FIXME: Ftrace timestamps must rise in value: "
-                            << "timestamp=" << timestamp << "ns, "
-                            << "timestamp_relative=" << *timestamp_relative_start << "ns";
-
-                // Super spammy warning, so throttle it for now.
-                did_warn = true;
-              }
-
-              // avoid underflow
-              timestamp_relative = 0;
-            } else {
-              timestamp_relative = timestamp - *timestamp_relative_start;
-            }
+          if (timestamp_relative_start){
+            timestamp_relative = timestamp - *timestamp_relative_start;
           } else {
             timestamp_relative = 0;
-          }
-
-          {
-            // FIXME: add an extra pass to calculate minimum timestamp for proper relativeness.
-            // Using this workaround will 'break' proper optimal merging of multiple traces,
-            // but a single trace will still be compiled fine.
-            timestamp_relative = timestamp;
           }
 
           pid = event.pid();  // XX: has_pid ?
@@ -808,8 +791,8 @@ auto/*observable<CompilerPageCacheEvent>*/ CompilePageCacheEvents(
   );   // observable<CompilerPageCacheEvent>
 }
 
-/** Builds a vector of info that includes filename and timestamp limit. */
-std::vector<PerfettoTraceFileInfo> BuildPerfettoTraceFileInfos(
+/** Makes a vector of info that includes filename and timestamp limit. */
+std::vector<CompilationInput> MakeCompilationInputs(
     std::vector<std::string> input_file_names,
     std::vector<uint64_t> timestamp_limit_ns){
   // If the timestamp limit is empty, set the limit to max value
@@ -820,20 +803,18 @@ std::vector<PerfettoTraceFileInfo> BuildPerfettoTraceFileInfos(
     }
   }
   DCHECK_EQ(input_file_names.size(), timestamp_limit_ns.size());
-  std::vector<PerfettoTraceFileInfo> file_infos;
+  std::vector<CompilationInput> file_infos;
   for (size_t i = 0; i < input_file_names.size(); i++) {
     file_infos.push_back({input_file_names[i], timestamp_limit_ns[i]});
   }
   return file_infos;
 }
 
-bool PerformCompilation(std::vector<std::string> input_file_names,
-                        std::vector<uint64_t> timestamp_limit_ns,
+bool PerformCompilation(std::vector<CompilationInput> perfetto_traces,
                         std::string output_file_name,
                         bool output_proto,
                         inode2filename::InodeResolverDependencies dependencies) {
-  auto file_infos = BuildPerfettoTraceFileInfos(input_file_names, timestamp_limit_ns);
-  auto trace_protos = ReadPerfettoTraceProtos(std::move(file_infos));
+  auto trace_protos = ReadPerfettoTraceProtos(std::move(perfetto_traces));
   auto resolved_events = ResolvePageCacheEntriesFromProtos(std::move(trace_protos),
                                                            std::move(dependencies));
   auto compiled_events = CompilePageCacheEvents(std::move(resolved_events));
