@@ -15,15 +15,61 @@
 #ifndef IORAP_SRC_MAINTENANCE_COMPILER_CONTROLLER_H_
 #define IORAP_SRC_MAINTENANCE_COMPILER_CONTROLLER_H_
 
+#include "db/file_models.h"
 #include "inode2filename/inode_resolver.h"
 
 #include <string>
 #include <vector>
 
 namespace iorap::maintenance {
+
+// Enabling mock for testing purpose.
+class IExec {
+ public:
+  virtual int Execve(const std::string& pathname,
+                     std::vector<std::string>& argv_vec,
+                     char *const envp[]) = 0;
+  virtual int Fork() = 0;
+  virtual ~IExec() = default;
+};
+
+class Exec : public IExec {
+ public:
+   virtual int Execve(const std::string& pathname,
+                      std::vector<std::string>& argv_vec,
+                      char *const envp[]);
+   virtual int Fork();
+};
+
+// Represents the parameters used for compilation controller.
+struct ControllerParameters {
+  bool output_text;
+  // The path of inode2filepath file.
+  std::optional<std::string> inode_textcache;
+  bool verbose;
+  bool recompile;
+  uint64_t min_traces;
+  std::shared_ptr<IExec> exec;
+
+  ControllerParameters(bool output_text,
+                       std::optional<std::string> inode_textcache,
+                       bool verbose,
+                       bool recompile,
+                       uint64_t min_traces,
+                       std::shared_ptr<IExec> exec) :
+    output_text(output_text),
+    inode_textcache(inode_textcache),
+    verbose(verbose),
+    recompile(recompile),
+    min_traces(min_traces),
+    exec(exec) {
+  }
+};
+
 // Control the compilation of perfetto traces in the sqlite db.
 //
-// The strategy now is to compile all the existing perfetto traces for an activity.
+// The strategy now is to compile all the existing perfetto traces for an activity
+// and skip ones if the number of perfetto traces is less than the min_traces.
 //
 // By default, the program doesn't replace the existing compiled trace, it just
 // return true. To force replace the existing compiled trace, set `force` to true.
@@ -33,25 +79,20 @@ namespace iorap::maintenance {
 // use the max.
 
 // Compile all activities of all packages in the database.
-bool Compile(const std::string& db_path,
-             bool output_text,
-             const inode2filename::InodeResolverDependencies& dependencies,
-             bool recompile);
+bool Compile(const std::string& db_path, const ControllerParameters& params);
 
 // Compile all activities in the package.
 bool Compile(const std::string& db_path,
              const std::string& package_name,
-             bool output_text,
-             const inode2filename::InodeResolverDependencies& dependencies,
-             bool recompile);
+             const ControllerParameters& params);
 
 // Compile trace for the activity.
 bool Compile(const std::string& db_path,
              const std::string& package_name,
              const std::string& activity_name,
-             bool output_text,
-             const inode2filename::InodeResolverDependencies& dependencies,
-             bool recompile);
+             const ControllerParameters& params);
+// Visible for testing.
+bool CompileAppsOnDevice(const db::DbHandle& db, const ControllerParameters& params);
 } // iorap::compiler_controller
 
 #endif  // IORAP_SRC_MAINTENANCE_COMPILER_CONTROLLER_H_

@@ -25,10 +25,12 @@
 #include "prefetcher/read_ahead.h"
 #include "prefetcher/task_id.h"
 
+#include <android-base/chrono_utils.h>
 #include <android-base/properties.h>
 #include <rxcpp/rx.hpp>
 
 #include <atomic>
+#include <filesystem>
 #include <functional>
 #include <utils/Trace.h>
 
@@ -67,6 +69,14 @@ struct AppLaunchEventState {
   // the raw_trace with the history_id.
   std::optional<rxcpp::subscriber<int>> history_id_subscriber_;
   rxcpp::observable<int> history_id_observable_;
+
+  std::optional<uint64_t> intent_started_ns_;
+  std::optional<uint64_t> total_time_ns_;
+
+  // Used by kReportFullyDrawn to find the right history_id.
+  // We assume no interleaving between different sequences.
+  // This assumption is checked in the Java service code.
+  std::optional<uint64_t> recent_history_id_;
 
   // labeled as 'shared' due to rx not being able to handle move-only objects.
   // lifetime: in practice equivalent to unique_ptr.
@@ -151,14 +161,19 @@ struct AppLaunchEventState {
         const std::string& package_name = event.intent_proto->component().package_name();
         const std::string& class_name = event.intent_proto->component().class_name();
         AppComponentName component_name{package_name, class_name};
-
-        component_name_ = component_name;
+        component_name_ = component_name.Canonicalize();
 
         if (allowed_readahead_) {
           StartReadAhead(sequence_id_, component_name);
         }
-        if (allowed_tracing_) {
+        if (allowed_tracing_ && !IsReadAhead()) {
           rx_lifetime_ = StartTracing(std::move(component_name));
+        }
+
+        if (event.timestamp_nanos >= 0) {
+          intent_started_ns_ = event.timestamp_nanos;
+        } else {
+          LOG(WARNING) << "Negative event timestamp: " << event.timestamp_nanos;
         }
 
         break;
@@ -198,13 +213,12 @@ struct AppLaunchEventState {
           }
 
           AppComponentName component_name = AppComponentName::FromString(title);
-
-          component_name_ = component_name;
+          component_name_ = component_name.Canonicalize();
 
           if (allowed_readahead_ && !IsReadAhead()) {
             StartReadAhead(sequence_id_, component_name);
           }
-          if (allowed_tracing_ && !IsTracing()) {
+          if (allowed_tracing_ && !IsTracing() && !IsReadAhead()) {
             rx_lifetime_ = StartTracing(std::move(component_name));
           }
         } else {
@@ -219,6 +233,9 @@ struct AppLaunchEventState {
         break;
       }
       case Type::kActivityLaunchFinished:
+        if (event.timestamp_nanos >= 0) {
+           total_time_ns_ = event.timestamp_nanos;
+        }
         RecordDbLaunchHistory();
         // Finish tracing and collect trace buffer.
         //
@@ -234,9 +251,15 @@ struct AppLaunchEventState {
         AbortTrace();
         AbortReadAhead();
         break;
-      case Type::kReportFullyDrawn:
-        // TODO(yawanng) add handling of this event.
+      case Type::kReportFullyDrawn: {
+        if (!recent_history_id_) {
+          LOG(WARNING) << "Dangling kReportFullyDrawn event";
+          return;
+        }
+        UpdateReportFullyDrawn(*recent_history_id_, event.timestamp_nanos);
+        recent_history_id_ = std::nullopt;
         break;
+      }
       default:
         DCHECK(false) << "invalid type: " << event;  // binder layer should've rejected this.
         LOG(ERROR) << "invalid type: " << event;  // binder layer should've rejected this.
@@ -248,17 +271,63 @@ struct AppLaunchEventState {
     return read_ahead_task_.has_value();
   }
 
-  void StartReadAhead(size_t id, const AppComponentName& component_name) {
-    DCHECK(allowed_readahead_);
-    DCHECK(!IsReadAhead());
+  // Gets the compiled trace.
+  // If a compiled trace exists in sqlite, use that one. Otherwise, try
+  // to find a prebuilt one.
+  std::optional<std::string> GetCompiledTrace(const AppComponentName& component_name) {
+    // Firstly, try to find the compiled trace from sqlite.
+    android::base::Timer timer{};
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+    std::optional<db::PrefetchFileModel> compiled_trace =
+        db::PrefetchFileModel::SelectByPackageNameActivityName(db,
+                                                               component_name.package,
+                                                               component_name.activity_name);
 
-    // This is changed from "/data/misc/iorapd/" for testing purpose.
-    // TODO: b/139831359.
+    std::chrono::milliseconds duration_ms = timer.duration();
+    LOG(DEBUG) << "EventManager: Looking up compiled trace done in "
+               << duration_ms.count() // the count of ticks.
+               << "ms.";
+
+    if (compiled_trace) {
+      if (std::filesystem::exists(compiled_trace->file_path)) {
+        return compiled_trace->file_path;
+      } else {
+        LOG(ERROR) << "Compiled trace in sqlite doesn't exists. file_path: "
+                   << compiled_trace->file_path;
+      }
+    }
+
+    LOG(DEBUG) << "Cannot find compiled trace in sqlite for package_name: "
+               << component_name.package
+               << " activity_name: "
+               << component_name.activity_name;
+
+    // If sqlite doesn't have the compiled trace, try the prebuilt path.
     std::string file_path = "/product/iorap-trace/";
     file_path += component_name.ToMakeFileSafeEncodedPkgString();
     file_path += ".compiled_trace.pb";
 
-    prefetcher::TaskId task{id, std::move(file_path)};
+    if (std::filesystem::exists(file_path)) {
+      return file_path;
+    }
+
+    LOG(ERROR) << "Prebuilt compiled trace doesn't exists. file_path: "
+               << file_path;
+
+    return std::nullopt;
+  }
+
+  void StartReadAhead(size_t id, const AppComponentName& component_name) {
+    DCHECK(allowed_readahead_);
+    DCHECK(!IsReadAhead());
+
+    std::optional<std::string> file_path = GetCompiledTrace(component_name);
+    if (!file_path) {
+      LOG(VERBOSE) << "Cannot find a compiled trace.";
+      return;
+    }
+
+    prefetcher::TaskId task{id, *file_path};
     read_ahead_->BeginTask(task);
     // TODO: non-void return signature?
 
@@ -426,11 +495,14 @@ struct AppLaunchEventState {
     if (!history) {
       history_id_subscriber_->on_error(rxcpp::util::make_error_ptr(
           std::ios_base::failure("Failed to insert history id")));
+      recent_history_id_ = std::nullopt;
     } else {
       // Note: we must have already subscribed, or this value will disappear.
       LOG(VERBOSE) << "history_id_subscriber on_next history_id=" << history->id;
       history_id_subscriber_->on_next(history->id);
       history_id_subscriber_->on_completed();
+
+      recent_history_id_ = history->id;
     }
     history_id_subscriber_ = std::nullopt;
   }
@@ -468,8 +540,11 @@ struct AppLaunchEventState {
                                       temp,
                                       IsTracing(),
                                       IsReadAhead(),
-                                      /*total_time_ns*/std::nullopt,
-                                      /*report_fully_drawn_ns*/std::nullopt);
+                                      intent_started_ns_,
+                                      total_time_ns_,
+                                      // ReportFullyDrawn event normally occurs after this. Need update later.
+                                      /* report_fully_drawn_ns= */ std::nullopt);
+    //Repo
     if (!alh) {
       LOG(WARNING) << "Failed to insert app_launch_histories row";
       return std::nullopt;
@@ -477,6 +552,26 @@ struct AppLaunchEventState {
 
     LOG(VERBOSE) << "RecordDbLaunchHistory: " << *alh;
     return alh;
+  }
+
+  void UpdateReportFullyDrawn(int history_id, uint64_t timestamp_ns) {
+    LOG(DEBUG) << "Update kReportFullyDrawn for history_id:"
+               << history_id
+               << " timestamp_ns: "
+               << timestamp_ns;
+
+    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+                               "IorapNativeService::UpdateReportFullyDrawn"};
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+
+    bool result =
+        db::AppLaunchHistoryModel::UpdateReportFullyDrawn(db,
+                                                          history_id,
+                                                          timestamp_ns);
+
+    if (!result) {
+      LOG(WARNING) << "Failed to update app_launch_histories row";
+    }
   }
 };
 

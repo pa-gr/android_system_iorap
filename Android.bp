@@ -61,6 +61,7 @@ cc_defaults {
     */
 
     clang: true,
+    static_libs: ["libc++fs"],
     shared_libs: ["libbase"],
 
     // build all ioraps for host.
@@ -244,18 +245,27 @@ cc_test_host {
         "iorap-default-flags",
         "iorap-default-dependencies",
         "libiorap-compiler-default-dependencies",
+        "libiorap-maintenance-default-dependencies",
     ],
     srcs: [
         "tests/src/compiler/*.cc",
+        "tests/src/db/*.cc",
+        "tests/src/maintenance/*.cc",
     ],
     data: [
         "tests/src/compiler/testdata/*",
+        "tests/src/maintenance/testdata/*",
     ],
     cflags: ["-O2", "-UNDEBUG"],
 
     // TODO:  we should probably have per-component tests.
-    static_libs: ["libgmock_main", "libgmock", "libgtest", "libiorap-compiler"],
-
+    static_libs: [
+    "libgmock_main",
+    "libgmock",
+    "libgtest",
+    "libiorap-compiler",
+    "libiorap-maintenance",
+    ],
 }
 
 filegroup {
@@ -469,7 +479,15 @@ cc_defaults {
         "libiorap-serialize",
     ],
     shared_libs: [
+        "libminijail",
     ],
+
+    // disable mac builds because libminijail doesn't work there
+    target: {
+        darwin: {
+            enabled: false,
+        },
+    },
 }
 
 cc_library_static {
@@ -552,6 +570,28 @@ cc_binary {
   ],
 }
 
+prebuilt_etc {
+  name: "iorap.prefetcherd.policy",
+  sub_dir: "seccomp_policy",
+  arch: {
+    arm: {
+      src: "seccomp_policy/prefetcherd.arm.policy"
+    },
+    arm64: {
+      src: "seccomp_policy/prefetcherd.arm64.policy"
+    },
+    x86: {
+      src: "seccomp_policy/prefetcherd.x86.policy"
+    },
+    x86_64: {
+      src: "seccomp_policy/prefetcherd.x86_64.policy"
+    },
+  },
+  required: [
+      "crash_dump.policy",
+  ],
+}
+
 // Static libraries cannot export their dependencies,
 // the current convention is to use an extra 'defaults' rule for statics
 // to bring in all the dependencies.
@@ -625,7 +665,6 @@ cc_defaults {
     include_dirs: [],
 
     static_libs: [
-        "libc++fs",
         "libiorap-compiler",
         "libiorap-db",
     ],
