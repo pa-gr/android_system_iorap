@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/cmd_utils.h"
 #include "common/debug.h"
 #include "compiler/compiler.h"
 #include "inode2filename/inode_resolver.h"
@@ -100,7 +101,12 @@ int Main(int argc, char** argv) {
         std::cerr << "Missing --timestamp_limit_ns <value>" << std::endl;
         return 1;
       }
-      timestamp_limit_ns.push_back(std::stoul(arg_next, nullptr, 10));
+      uint64_t timestamp;
+      if (!::android::base::ParseUint<uint64_t>(arg_next, &timestamp)) {
+        std::cerr << "Invalid --timestamp-limit-ns "<< arg_next << std::endl;
+        return 1;
+      }
+      timestamp_limit_ns.push_back(timestamp);
       ++arg;
     } else {
       arg_input_filenames.push_back(argstr);
@@ -156,7 +162,11 @@ int Main(int argc, char** argv) {
   ir_dependencies.root_directories.push_back("/product");
   ir_dependencies.root_directories.push_back("/metadata");
   // Hardcoded.
-  ir_dependencies.process_mode = ProcessMode::kInProcessDirect;  // TODO: others.
+  if (iorap::common::GetBoolEnvOrProperty("iorap.inode2filename.out_of_process", true)) {
+    ir_dependencies.process_mode = ProcessMode::kOutOfProcessIpc;
+  } else {
+    ir_dependencies.process_mode = ProcessMode::kInProcessDirect;
+  }
   ir_dependencies.system_call = /*borrowed*/system_call.get();
 
   int return_code = 0;
