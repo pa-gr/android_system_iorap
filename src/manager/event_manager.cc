@@ -18,6 +18,7 @@
 #include "common/debug.h"
 #include "common/expected.h"
 #include "common/rx_async.h"
+#include "common/trace.h"
 #include "db/app_component_name.h"
 #include "db/file_models.h"
 #include "db/models.h"
@@ -181,7 +182,7 @@ struct AppLaunchEventState {
   void OnNewEvent(const AppLaunchEvent& event) {
     LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: " << event;
 
-    android::ScopedTrace trace_db_init{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace_db_init{ATRACE_TAG_ACTIVITY_MANAGER,
                                        "IorapNativeService::OnAppLaunchEvent"};
 
     using Type = AppLaunchEvent::Type;
@@ -368,6 +369,7 @@ struct AppLaunchEventState {
   // If a compiled trace exists in sqlite, use that one. Otherwise, try
   // to find a prebuilt one.
   std::optional<std::string> GetCompiledTrace(const AppComponentName& component_name) {
+    ScopedFormatTrace atrace_get_compiled_trace(ATRACE_TAG_ACTIVITY_MANAGER, "GetCompiledTrace");
     // Firstly, try to find the compiled trace from sqlite.
     android::base::Timer timer{};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
@@ -375,6 +377,7 @@ struct AppLaunchEventState {
     db::VersionedComponentName vcn{component_name.package,
                                    component_name.activity_name,
                                    version};
+
     std::optional<db::PrefetchFileModel> compiled_trace =
           db::PrefetchFileModel::SelectByVersionedComponentName(db, vcn);
 
@@ -501,6 +504,10 @@ struct AppLaunchEventState {
 
           std::string file_path = file_model.FilePath();
 
+          ScopedFormatTrace atrace_write_to_file(ATRACE_TAG_ACTIVITY_MANAGER,
+                                                 "Perfetto Write Trace To File %s",
+                                                 file_path.c_str());
+
           if (!file_model.MkdirWithParents()) {
             LOG(ERROR) << "Cannot save TraceBuffer; failed to mkdirs " << file_path;
             return;
@@ -511,6 +518,10 @@ struct AppLaunchEventState {
           } else {
             LOG(INFO) << "Perfetto TraceBuffer saved to file: " << file_path;
 
+            ScopedFormatTrace atrace_update_raw_traces_table(
+                ATRACE_TAG_ACTIVITY_MANAGER,
+                "update raw_traces table history_id = %d",
+                history_id);
             db::DbHandle db{db::SchemaModel::GetSingleton()};
             std::optional<db::RawTraceModel> raw_trace =
                 db::RawTraceModel::Insert(db, history_id, file_path);
@@ -519,6 +530,10 @@ struct AppLaunchEventState {
               LOG(ERROR) << "Failed to insert raw_traces for " << file_path;
             } else {
               LOG(VERBOSE) << "Inserted into db: " << *raw_trace;
+
+              ScopedFormatTrace atrace_delete_older_files(
+                  ATRACE_TAG_ACTIVITY_MANAGER,
+                  "Delete older trace files for package");
 
               // Ensure we don't have too many files per-app.
               db::PerfettoTraceFileModel::DeleteOlderFiles(db, versioned_component_name);
@@ -613,7 +628,7 @@ struct AppLaunchEventState {
       return std::nullopt;
     }
 
-    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace{ATRACE_TAG_ACTIVITY_MANAGER,
                                "IorapNativeService::RecordDbLaunchHistory"};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
 
@@ -659,7 +674,7 @@ struct AppLaunchEventState {
                << " timestamp_ns: "
                << timestamp_ns;
 
-    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace{ATRACE_TAG_ACTIVITY_MANAGER,
                                "IorapNativeService::UpdateReportFullyDrawn"};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
 
@@ -890,8 +905,7 @@ class EventManager::Impl {
       worker_thread2_(rxcpp::observe_on_new_thread()),
       io_thread_(perfetto::ObserveOnNewIoThread()) {
     // Try to create version map
-    RetryCreateVersionMap(/*timeout*/std::chrono::seconds(60),
-                          /*interval*/std::chrono::seconds(1));
+    RetryCreateVersionMap();
 
     // TODO: read all properties from one config class.
     // PH properties do not work if they contain ".". "_" was instead used here.
@@ -922,23 +936,9 @@ class EventManager::Impl {
     rx_lifetime_jobs_ = InitializeRxGraphForJobScheduledEvents();
   }
 
-  void RetryCreateVersionMap(std::chrono::seconds timeout,
-                             std::chrono::seconds interval) {
+  void RetryCreateVersionMap() {
     android::base::Timer timer{};
-    int64_t count = 0;
     version_map_ = binder::PackageVersionMap::Create();
-    while (version_map_ == nullptr) {
-      std::this_thread::sleep_for(interval);
-      LOG(WARNING) << "Retry to create version map: " << ++count;
-      version_map_ = binder::PackageVersionMap::Create();
-      if (count * interval >= timeout) {
-        LOG(FATAL) << "Fail to create version map in "
-                   << timeout.count()
-                   << " seconds.";
-        abort();
-        break;
-      }
-    }
     std::chrono::milliseconds duration_ms = timer.duration();
     LOG(DEBUG) << "Got versions for "
                << version_map_->Size()
@@ -1049,21 +1049,38 @@ class EventManager::Impl {
                         bool verbose,
                         bool recompile,
                         uint64_t min_traces) {
-    // Update the version map.
-    version_map_->Update();
-    // Cleanup the obsolete data in the database.
-    db::DbHandle db{db::SchemaModel::GetSingleton()};
-    maintenance::CleanUpDatabase(db, version_map_);
-    // Compilation
-    maintenance::ControllerParameters params{
-      output_text,
-      inode_textcache,
-      verbose,
-      recompile,
-      min_traces,
-      std::make_shared<maintenance::Exec>()};
+    ScopedFormatTrace atrace_bg_scope(ATRACE_TAG_PACKAGE_MANAGER,
+                                      "Background Job Scope");
 
-    maintenance::CompileAppsOnDevice(db, params);
+    {
+      ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
+                                               "Update package versions map cache");
+      // Update the version map.
+      version_map_->Update();
+    }
+
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+    {
+      ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
+                                          "Clean up obsolete data in database");
+      // Cleanup the obsolete data in the database.
+      maintenance::CleanUpDatabase(db, version_map_);
+    }
+
+    {
+      ScopedFormatTrace atrace_compile_apps(ATRACE_TAG_PACKAGE_MANAGER,
+                                            "Compile apps on device");
+      // Compilation
+      maintenance::ControllerParameters params{
+        output_text,
+        inode_textcache,
+        verbose,
+        recompile,
+        min_traces,
+        std::make_shared<maintenance::Exec>()};
+
+      maintenance::CompileAppsOnDevice(db, params);
+    }
   }
 
   rxcpp::composite_subscription InitializeRxGraphForJobScheduledEvents() {
