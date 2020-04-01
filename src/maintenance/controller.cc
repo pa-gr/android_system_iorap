@@ -28,6 +28,7 @@
 #include <android-base/file.h>
 #include <utils/Printer.h>
 
+#include <chrono>
 #include <ctime>
 #include <iostream>
 #include <filesystem>
@@ -41,6 +42,7 @@
 
 namespace iorap::maintenance {
 
+const constexpr int64_t kCompilerCheckIntervalMs = 10;
 static constexpr size_t kMinTracesForCompilation = 3;
 
 struct LastJobInfo {
@@ -124,6 +126,30 @@ std::vector<std::string> MakeCompilerParams(const CompilerForkParameters& params
     return argv;
 }
 
+// Sets a watch dog for the given pid and kill it if timeout.
+std::thread SetTimeoutWatchDog(pid_t pid, int64_t timeout_ms, std::atomic<bool>& cancel_watchdog) {
+  std::thread watchdog_thread{[&]() {
+    std::chrono::time_point start = std::chrono::system_clock::now();
+    std::chrono::milliseconds timeout(timeout_ms);
+    while (!cancel_watchdog) {
+      int status = kill(pid, 0);
+      if (status != 0) {
+        LOG(DEBUG) << "Process (" << pid << ") doesn't exist now.";
+        break;
+      }
+      std::chrono::time_point cur = std::chrono::system_clock::now();
+      if (cur - start > timeout) {
+        LOG(INFO) << "Process (" << pid << ") is timeout!";
+        kill(pid, SIGKILL);
+        break;
+      }
+      usleep(kCompilerCheckIntervalMs * 1000);
+    }
+  }};
+
+  return watchdog_thread;
+}
+
 bool StartViaFork(const CompilerForkParameters& params) {
   const ControllerParameters& controller_params = params.controller_params;
   pid_t child = controller_params.exec->Fork();
@@ -133,8 +159,19 @@ bool StartViaFork(const CompilerForkParameters& params) {
   } else if (child > 0) {  // we are the caller of this function
     LOG(DEBUG) << "forked into a process for compilation , pid = " << child;
 
+    int64_t compiler_timeout_ms =
+        android::base::GetIntProperty("iorapd.maintenance.compiler_timeout_ms",
+                                       /*default*/ 10 * 60 * 1000); // 10 min
+    std::atomic<bool> cancel_watchdog(false);
+    std::thread watchdog_thread = SetTimeoutWatchDog(child, compiler_timeout_ms, cancel_watchdog);
     int wstatus;
     waitpid(child, /*out*/&wstatus, /*options*/0);
+
+    // Terminate the thread after the compiler process is killed or done.
+    LOG(DEBUG) << "Terminate the watch dog thread.";
+    cancel_watchdog = true;
+    watchdog_thread.join();
+
     if (!WIFEXITED(wstatus)) {
       LOG(ERROR) << "Child terminated abnormally, status: " << WEXITSTATUS(wstatus);
       return false;
@@ -173,8 +210,7 @@ std::vector<compiler::CompilationInput> GetPerfettoTraceInfo(
     std::optional<db::RawTraceModel> raw_trace =
         db::RawTraceModel::SelectByHistoryId(db, history.id);
     if (!raw_trace) {
-      LOG(ERROR) << "Cannot find raw trace for history_id: "
-                 << history.id;
+      // This is normal: non-cold launches do not have traces.
       continue;
     }
 
@@ -225,6 +261,8 @@ bool CompileActivity(const db::DbHandle& db,
   ScopedFormatTrace atrace_compile_package(ATRACE_TAG_PACKAGE_MANAGER,
                                            "Compile activity %s",
                                            activity_name.c_str());
+
+  LOG(DEBUG) << "CompileActivity: " << package_name << "/" << activity_name << "@" << version;
 
   db::CompiledTraceFileModel output_file =
       CalculateNewestFilePath(package_name, activity_name, version);
