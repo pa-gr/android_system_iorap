@@ -18,6 +18,7 @@
 #include "common/debug.h"
 #include "common/expected.h"
 #include "common/rx_async.h"
+#include "common/trace.h"
 #include "db/app_component_name.h"
 #include "db/file_models.h"
 #include "db/models.h"
@@ -181,7 +182,7 @@ struct AppLaunchEventState {
   void OnNewEvent(const AppLaunchEvent& event) {
     LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: " << event;
 
-    android::ScopedTrace trace_db_init{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace_db_init{ATRACE_TAG_ACTIVITY_MANAGER,
                                        "IorapNativeService::OnAppLaunchEvent"};
 
     using Type = AppLaunchEvent::Type;
@@ -368,6 +369,7 @@ struct AppLaunchEventState {
   // If a compiled trace exists in sqlite, use that one. Otherwise, try
   // to find a prebuilt one.
   std::optional<std::string> GetCompiledTrace(const AppComponentName& component_name) {
+    ScopedFormatTrace atrace_get_compiled_trace(ATRACE_TAG_ACTIVITY_MANAGER, "GetCompiledTrace");
     // Firstly, try to find the compiled trace from sqlite.
     android::base::Timer timer{};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
@@ -375,6 +377,7 @@ struct AppLaunchEventState {
     db::VersionedComponentName vcn{component_name.package,
                                    component_name.activity_name,
                                    version};
+
     std::optional<db::PrefetchFileModel> compiled_trace =
           db::PrefetchFileModel::SelectByVersionedComponentName(db, vcn);
 
@@ -406,7 +409,7 @@ struct AppLaunchEventState {
       return file_path;
     }
 
-    LOG(ERROR) << "Prebuilt compiled trace doesn't exists. file_path: "
+    LOG(DEBUG) << "Prebuilt compiled trace doesn't exists. file_path: "
                << file_path;
 
     return std::nullopt;
@@ -501,6 +504,10 @@ struct AppLaunchEventState {
 
           std::string file_path = file_model.FilePath();
 
+          ScopedFormatTrace atrace_write_to_file(ATRACE_TAG_ACTIVITY_MANAGER,
+                                                 "Perfetto Write Trace To File %s",
+                                                 file_path.c_str());
+
           if (!file_model.MkdirWithParents()) {
             LOG(ERROR) << "Cannot save TraceBuffer; failed to mkdirs " << file_path;
             return;
@@ -511,6 +518,10 @@ struct AppLaunchEventState {
           } else {
             LOG(INFO) << "Perfetto TraceBuffer saved to file: " << file_path;
 
+            ScopedFormatTrace atrace_update_raw_traces_table(
+                ATRACE_TAG_ACTIVITY_MANAGER,
+                "update raw_traces table history_id = %d",
+                history_id);
             db::DbHandle db{db::SchemaModel::GetSingleton()};
             std::optional<db::RawTraceModel> raw_trace =
                 db::RawTraceModel::Insert(db, history_id, file_path);
@@ -519,6 +530,10 @@ struct AppLaunchEventState {
               LOG(ERROR) << "Failed to insert raw_traces for " << file_path;
             } else {
               LOG(VERBOSE) << "Inserted into db: " << *raw_trace;
+
+              ScopedFormatTrace atrace_delete_older_files(
+                  ATRACE_TAG_ACTIVITY_MANAGER,
+                  "Delete older trace files for package");
 
               // Ensure we don't have too many files per-app.
               db::PerfettoTraceFileModel::DeleteOlderFiles(db, versioned_component_name);
@@ -547,9 +562,9 @@ struct AppLaunchEventState {
     if (rx_lifetime_) {
       // TODO: it would be good to call perfetto Destroy.
 
-      std::remove(rx_in_flight_.begin(),
-                  rx_in_flight_.end(),
-                  *rx_lifetime_);
+      rx_in_flight_.erase(std::remove(rx_in_flight_.begin(),
+                                      rx_in_flight_.end(), *rx_lifetime_),
+                          rx_in_flight_.end());
 
       LOG(VERBOSE) << "AppLaunchEventState - AbortTrace - Unsubscribe";
       rx_lifetime_->unsubscribe();
@@ -613,7 +628,7 @@ struct AppLaunchEventState {
       return std::nullopt;
     }
 
-    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace{ATRACE_TAG_ACTIVITY_MANAGER,
                                "IorapNativeService::RecordDbLaunchHistory"};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
 
@@ -659,7 +674,7 @@ struct AppLaunchEventState {
                << " timestamp_ns: "
                << timestamp_ns;
 
-    android::ScopedTrace trace{ATRACE_TAG_PACKAGE_MANAGER,
+    android::ScopedTrace trace{ATRACE_TAG_ACTIVITY_MANAGER,
                                "IorapNativeService::UpdateReportFullyDrawn"};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
 
@@ -670,6 +685,85 @@ struct AppLaunchEventState {
 
     if (!result) {
       LOG(WARNING) << "Failed to update app_launch_histories row";
+    }
+  }
+};
+
+struct AppLaunchEventDefender {
+  binder::AppLaunchEvent::Type last_event_type_{binder::AppLaunchEvent::Type::kUninitialized};
+
+  enum class Result {
+    kAccept,      // Pass-through the new event.
+    kOverwrite,   // Overwrite the new event with a different event.
+    kReject       // Completely reject the new event, it will not be delivered.
+  };
+
+  Result OnAppLaunchEvent(binder::RequestId request_id,
+                          const binder::AppLaunchEvent& event,
+                          binder::AppLaunchEvent* overwrite) {
+    using Type = binder::AppLaunchEvent::Type;
+    CHECK(overwrite != nullptr);
+
+    // Ensure only legal transitions are allowed.
+    switch (last_event_type_) {
+      case Type::kUninitialized:
+      case Type::kIntentFailed:
+      case Type::kActivityLaunchCancelled:
+      case Type::kReportFullyDrawn: {  // From a terminal state, only go to kIntentStarted
+        if (event.type != Type::kIntentStarted) {
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = Type::kUninitialized;
+          return Result::kReject;
+        } else {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        }
+      }
+      case Type::kIntentStarted: {
+        if (event.type == Type::kIntentFailed ||
+            event.type == Type::kActivityLaunched) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Overwriting transition from kIntentStarted to "
+                       << event.type << " into kIntentFailed";
+          last_event_type_ = Type::kIntentFailed;
+
+          *overwrite = event;
+          overwrite->type = Type::kIntentFailed;
+          return Result::kOverwrite;
+        }
+      }
+      case Type::kActivityLaunched: {
+        if (event.type == Type::kActivityLaunchFinished ||
+            event.type == Type::kActivityLaunchCancelled) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Overwriting transition from kActivityLaunched to "
+                       << event.type << " into kActivityLaunchCancelled";
+          last_event_type_ = Type::kActivityLaunchCancelled;
+
+          *overwrite = event;
+          overwrite->type = Type::kActivityLaunchCancelled;
+          return Result::kOverwrite;
+        }
+      }
+      case Type::kActivityLaunchFinished: {
+        if (event.type == Type::kIntentStarted ||
+            event.type == Type::kReportFullyDrawn) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = Type::kUninitialized;
+          return Result::kReject;
+        }
+      }
     }
   }
 };
@@ -811,8 +905,7 @@ class EventManager::Impl {
       worker_thread2_(rxcpp::observe_on_new_thread()),
       io_thread_(perfetto::ObserveOnNewIoThread()) {
     // Try to create version map
-    RetryCreateVersionMap(/*timeout*/std::chrono::seconds(60),
-                          /*interval*/std::chrono::seconds(1));
+    RetryCreateVersionMap();
 
     // TODO: read all properties from one config class.
     // PH properties do not work if they contain ".". "_" was instead used here.
@@ -820,11 +913,11 @@ class EventManager::Impl {
     tracing_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
         ph_namespace,
         "iorap_perfetto_enable",
-        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"true")) == "true";
+        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"false")) == "true";
     readahead_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
         ph_namespace,
         "iorap_readahead_enable",
-        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"true")) == "true";
+        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"false")) == "true";
 
     package_blacklister_ = PackageBlacklister{
         /* Colon-separated string list of blacklisted packages, e.g.
@@ -843,23 +936,9 @@ class EventManager::Impl {
     rx_lifetime_jobs_ = InitializeRxGraphForJobScheduledEvents();
   }
 
-  void RetryCreateVersionMap(std::chrono::seconds timeout,
-                             std::chrono::seconds interval) {
+  void RetryCreateVersionMap() {
     android::base::Timer timer{};
-    int64_t count = 0;
     version_map_ = binder::PackageVersionMap::Create();
-    while (version_map_ == nullptr) {
-      std::this_thread::sleep_for(interval);
-      LOG(WARNING) << "Retry to create version map: " << ++count;
-      version_map_ = binder::PackageVersionMap::Create();
-      if (count * interval >= timeout) {
-        LOG(FATAL) << "Fail to create version map in "
-                   << timeout.count()
-                   << " seconds.";
-        abort();
-        break;
-      }
-    }
     std::chrono::milliseconds duration_ms = timer.duration();
     LOG(DEBUG) << "Got versions for "
                << version_map_->Size()
@@ -883,9 +962,28 @@ class EventManager::Impl {
                  << "request_id=" << request_id.request_id << ","
                  << event;
 
-    app_launch_event_subject_.OnNext(event);
+    // Filter any incoming events through a defender that enforces
+    // that all state transitions are as contractually documented in
+    // ActivityMetricsLaunchObserver's javadoc.
+    AppLaunchEvent overwrite_event{};
+    AppLaunchEventDefender::Result result =
+        app_launch_event_defender_.OnAppLaunchEvent(request_id, event, /*out*/&overwrite_event);
 
-    return true;
+    switch (result) {
+      case AppLaunchEventDefender::Result::kAccept:
+        app_launch_event_subject_.OnNext(event);
+        return true;
+      case AppLaunchEventDefender::Result::kOverwrite:
+        app_launch_event_subject_.OnNext(overwrite_event);
+        return false;
+      case AppLaunchEventDefender::Result::kReject:
+        // Intentionally left-empty: we drop the event completely.
+        return false;
+    }
+
+    // In theory returns BAD_VALUE to the other side of this binder connection.
+    // In practice we use 'oneway' flags so this doesn't matter on a regular build.
+    return false;
   }
 
   bool OnJobScheduledEvent(RequestId request_id,
@@ -896,6 +994,12 @@ class EventManager::Impl {
     job_scheduled_event_subject_.OnNext(std::move(request_id), event);
 
     return true;  // No errors.
+  }
+
+  void Dump(/*borrow*/::android::Printer& printer) {
+    ::iorap::prefetcher::ReadAhead::Dump(printer);
+    ::iorap::perfetto::PerfettoConsumerImpl::Dump(/*borrow*/printer);
+    ::iorap::maintenance::Dump(db::SchemaModel::GetSingleton(), printer);
   }
 
   rxcpp::composite_subscription InitializeRxGraph() {
@@ -945,21 +1049,38 @@ class EventManager::Impl {
                         bool verbose,
                         bool recompile,
                         uint64_t min_traces) {
-    // Update the version map.
-    version_map_->Update();
-    // Cleanup the obsolete data in the database.
-    db::DbHandle db{db::SchemaModel::GetSingleton()};
-    maintenance::CleanUpDatabase(db, version_map_);
-    // Compilation
-    maintenance::ControllerParameters params{
-      output_text,
-      inode_textcache,
-      verbose,
-      recompile,
-      min_traces,
-      std::make_shared<maintenance::Exec>()};
+    ScopedFormatTrace atrace_bg_scope(ATRACE_TAG_PACKAGE_MANAGER,
+                                      "Background Job Scope");
 
-    maintenance::CompileAppsOnDevice(db, params);
+    {
+      ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
+                                               "Update package versions map cache");
+      // Update the version map.
+      version_map_->Update();
+    }
+
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+    {
+      ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
+                                          "Clean up obsolete data in database");
+      // Cleanup the obsolete data in the database.
+      maintenance::CleanUpDatabase(db, version_map_);
+    }
+
+    {
+      ScopedFormatTrace atrace_compile_apps(ATRACE_TAG_PACKAGE_MANAGER,
+                                            "Compile apps on device");
+      // Compilation
+      maintenance::ControllerParameters params{
+        output_text,
+        inode_textcache,
+        verbose,
+        recompile,
+        min_traces,
+        std::make_shared<maintenance::Exec>()};
+
+      maintenance::CompileAppsOnDevice(db, params);
+    }
   }
 
   rxcpp::composite_subscription InitializeRxGraphForJobScheduledEvents() {
@@ -1061,6 +1182,7 @@ class EventManager::Impl {
   using AppLaunchEventRefWrapper = AppLaunchEventSubject::RefWrapper;
   rxcpp::observable<AppLaunchEventRefWrapper> app_launch_events_;
   AppLaunchEventSubject app_launch_event_subject_;
+  AppLaunchEventDefender app_launch_event_defender_;
 
   rxcpp::observable<std::pair<RequestId, JobScheduledEvent>> job_scheduled_events_;
   JobScheduledEventSubject job_scheduled_event_subject_;
@@ -1126,6 +1248,10 @@ bool EventManager::OnAppLaunchEvent(RequestId request_id,
 bool EventManager::OnJobScheduledEvent(RequestId request_id,
                                        const JobScheduledEvent& event) {
   return impl_->OnJobScheduledEvent(request_id, event);
+}
+
+void EventManager::Dump(/*borrow*/::android::Printer& printer) {
+  return impl_->Dump(printer);
 }
 
 }  // namespace iorap::manager

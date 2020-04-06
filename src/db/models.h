@@ -585,18 +585,20 @@ class PackageModel : public Model {
     return p;
   }
 
-  static std::optional<PackageModel> SelectByName(DbHandle db, const char* name) {
+  static std::vector<PackageModel> SelectByName(DbHandle db, const char* name) {
     ScopedLockDb lock{db};
 
-    std::string query = "SELECT * FROM packages WHERE name = ?1 LIMIT 1;";
+    std::string query = "SELECT * FROM packages WHERE name = ?1;";
     DbStatement stmt = DbStatement::Prepare(db, query, name);
 
+    std::vector<PackageModel> packages;
+
     PackageModel p{db};
-    if (!DbQueryBuilder::SelectOnce(stmt, p.id, p.name, p.version)) {
-      return std::nullopt;
+    while (DbQueryBuilder::SelectOnce(stmt, p.id, p.name, p.version)) {
+      packages.push_back(p);
     }
 
-    return p;
+    return packages;
   }
 
   static std::optional<PackageModel> SelectByNameAndVersion(DbHandle db,
@@ -1068,6 +1070,23 @@ class PrefetchFileModel : public Model {
     }
 
     return p;
+  }
+
+  static std::vector<PrefetchFileModel> SelectAll(DbHandle db) {
+    ScopedLockDb lock{db};
+
+    std::string query =
+      "SELECT prefetch_files.id, prefetch_files.activity_id, prefetch_files.file_path "
+      "FROM prefetch_files";
+    DbStatement stmt = DbStatement::Prepare(db, query);
+
+    std::vector<PrefetchFileModel> prefetch_files;
+    PrefetchFileModel p{db};
+    while (DbQueryBuilder::SelectOnce(stmt, p.id, p.activity_id, p.file_path)) {
+      prefetch_files.push_back(p);
+    }
+
+    return prefetch_files;
   }
 
   static std::optional<PrefetchFileModel> Insert(DbHandle db,

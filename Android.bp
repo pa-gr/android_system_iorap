@@ -175,9 +175,11 @@ cc_binary {
         "iorapd.rc",
     ],
     // iorapd fork+execs into iorap.prefetcherd and iorap.cmd.compiler
+    // maintenance used by tests
     required: [
         "iorap.cmd.compiler",
         "iorap.prefetcherd",
+        "iorap.cmd.maintenance",
     ],
 }
 
@@ -670,6 +672,7 @@ cc_defaults {
     defaults: [
         "libiorap-compiler-default-dependencies",
         "libiorap-db-default-dependencies",
+        "libiorap-prefetcher-default-dependencies",
     ],
 
     include_dirs: [],
@@ -678,6 +681,7 @@ cc_defaults {
         "libiorap-binder",
         "libiorap-compiler",
         "libiorap-db",
+        "libiorap-prefetcher",
     ],
 
     shared_libs: []
