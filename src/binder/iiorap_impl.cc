@@ -177,6 +177,14 @@ class IIorapImpl::Impl {
     return service_params_.event_manager_->OnAppLaunchEvent(request_id, event);
   }
 
+  bool OnDexOptEvent(const RequestId& request_id, const DexOptEvent& event) {
+    if (MaybeHandleFakeBehavior(request_id)) {
+      return true;
+    }
+
+    return service_params_.event_manager_->OnDexOptEvent(request_id, event);
+  }
+
   bool  OnJobScheduledEvent(const RequestId& request_id,
                             const JobScheduledEvent& event) {
     if (MaybeHandleFakeBehavior(request_id)) {
@@ -197,7 +205,10 @@ class IIorapImpl::Impl {
     ::android::String16 arg_prev;
     for (const ::android::String16& arg : args) {
       bool unknown = false;
-      if (arg == ::android::String16("--refresh-properties")) {
+      if (arg == ::android::String16("--all") || arg == ::android::String16("-a")) {
+        // using 'dumpsys' or 'bugreport' passes a single '-a' flag to this function.
+        service_params_.event_manager_->Dump(/*borrow*/printer);
+      } else if (arg == ::android::String16("--refresh-properties")) {
         service_params_.event_manager_->RefreshSystemProperties(/*borrow*/printer);
         printer.printLine("System properties refreshed.");
       } else if (arg == ::android::String16("--compile-package")) {
@@ -227,11 +238,17 @@ class IIorapImpl::Impl {
       if (unknown && arg != ::android::String16("--help")) {
         printer.printLine("Invalid arguments.");
         printer.printLine("");
+
+        printer.printLine("Arguments were:");
+        for (const ::android::String16& arg16 : args) {
+          printer.printFormatLine("  '%s'", String16ToStdString(arg16).c_str());
+        }
+        printer.printLine("");
       }
 
       if (unknown || arg == ::android::String16("--help")) {
         printer.printLine("Iorapd dumpsys commands:");
-        printer.printLine(" (0 args): Print state information for debugging iorapd.");
+        printer.printLine("  (none),--all,-a: Print state information for debugging iorapd.");
         printer.printLine("  --help: Display this help menu");
         printer.printLine("  --compile-package <name>: Compile single package on device");
         printer.printLine("  --purge-package <name>: Delete database entries/files for package");
@@ -415,6 +432,23 @@ Status SendArgs(const char* function_name,
     //
     // Most of the work here is done async, so it should handle
     // async callbacks.
+    return Status::fromStatusT(::android::BAD_VALUE);
+  }
+}
+
+template <typename ... Args>
+Status SendArgs(const char* function_name,
+                Impl* self,
+                const RequestId& request_id,
+                const DexOptEvent& event) {
+  DCHECK_EQ(std::string(function_name), "onDexOptEvent");
+  LOG(VERBOSE) << "IIorap::onDexOptEvent";
+
+  MAYBE_HAVE_FAKE_BEHAVIOR(self, request_id);
+
+  if (self->OnDexOptEvent(request_id, event)) {
+    return Status::ok();
+  } else {
     return Status::fromStatusT(::android::BAD_VALUE);
   }
 }
