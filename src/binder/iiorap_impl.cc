@@ -26,6 +26,10 @@
 #include <include/binder/request_id.h>
 #include <utils/Printer.h>
 
+#include <codecvt>
+#include <locale>
+#include <utility>
+
 /*
  * Definitions for the IIorap binder native service implementation.
  * See also IIorap.aidl.
@@ -77,7 +81,14 @@ static std::atomic<bool> s_service_params_ready_{false};
 static ServiceParams s_service_params_;
 static std::atomic<ServiceParams*> s_service_params_atomic_;
 
+// Convert an android::String16 (UTF-16) to a UTF-8 std::string.
+static std::string String16ToStdString(const ::android::String16& s16) {
+  std::u16string u16{s16.string()};
+  std::wstring_convert<std::codecvt_utf8_utf16<char16_t>,char16_t> convert;
 
+  std::string res = convert.to_bytes(u16);
+  return res;
+}
 
 }  // namespace anonymous
 
@@ -166,6 +177,14 @@ class IIorapImpl::Impl {
     return service_params_.event_manager_->OnAppLaunchEvent(request_id, event);
   }
 
+  bool OnDexOptEvent(const RequestId& request_id, const DexOptEvent& event) {
+    if (MaybeHandleFakeBehavior(request_id)) {
+      return true;
+    }
+
+    return service_params_.event_manager_->OnDexOptEvent(request_id, event);
+  }
+
   bool  OnJobScheduledEvent(const RequestId& request_id,
                             const JobScheduledEvent& event) {
     if (MaybeHandleFakeBehavior(request_id)) {
@@ -175,8 +194,70 @@ class IIorapImpl::Impl {
     return service_params_.event_manager_->OnJobScheduledEvent(request_id, event);
   }
 
-  void Dump(/*borrow*/::android::Printer& printer) {
-    return service_params_.event_manager_->Dump(/*borrow*/printer);
+  void Dump(/*borrow*/::android::Printer& printer,
+            const ::android::Vector<::android::String16>& args) {
+
+    if (args.size() == 0) {
+      service_params_.event_manager_->Dump(/*borrow*/printer);
+      return;
+    }
+
+    ::android::String16 arg_prev;
+    for (const ::android::String16& arg : args) {
+      bool unknown = false;
+      if (arg == ::android::String16("--all") || arg == ::android::String16("-a")) {
+        // using 'dumpsys' or 'bugreport' passes a single '-a' flag to this function.
+        service_params_.event_manager_->Dump(/*borrow*/printer);
+      } else if (arg == ::android::String16("--refresh-properties")) {
+        service_params_.event_manager_->RefreshSystemProperties(/*borrow*/printer);
+        printer.printLine("System properties refreshed.");
+      } else if (arg == ::android::String16("--compile-package")) {
+        // Intentionally left blank.
+      } else if (arg_prev == ::android::String16("--compile-package")) {
+        std::string package_name = String16ToStdString(arg);
+
+        if (!service_params_.event_manager_->CompilePackage(/*borrow*/printer, package_name)) {
+          printer.printFormatLine("Failed to compile package %s.", package_name.c_str());
+        } else {
+          printer.printFormatLine("Package %s compiled.", package_name.c_str());
+        }
+      } else if (arg == ::android::String16("--purge-package")) {
+        // Intentionally left blank.
+      } else if (arg_prev == ::android::String16("--purge-package")) {
+        std::string package_name = String16ToStdString(arg);
+
+        if (!service_params_.event_manager_->PurgePackage(/*borrow*/printer, package_name)) {
+          printer.printFormatLine("Failed to purge package %s.", package_name.c_str());
+        } else {
+          printer.printFormatLine("Package %s purged.", package_name.c_str());
+        }
+      } else {
+        unknown = true;
+      }
+
+      if (unknown && arg != ::android::String16("--help")) {
+        printer.printLine("Invalid arguments.");
+        printer.printLine("");
+
+        printer.printLine("Arguments were:");
+        for (const ::android::String16& arg16 : args) {
+          printer.printFormatLine("  '%s'", String16ToStdString(arg16).c_str());
+        }
+        printer.printLine("");
+      }
+
+      if (unknown || arg == ::android::String16("--help")) {
+        printer.printLine("Iorapd dumpsys commands:");
+        printer.printLine("  (none),--all,-a: Print state information for debugging iorapd.");
+        printer.printLine("  --help: Display this help menu");
+        printer.printLine("  --compile-package <name>: Compile single package on device");
+        printer.printLine("  --purge-package <name>: Delete database entries/files for package");
+        printer.printLine("  --refresh-properties: Refresh system properties");
+        return;
+      }
+
+      arg_prev = arg;
+    }
   }
 
   void HandleFakeBehavior(const RequestId& request_id) {
@@ -297,7 +378,7 @@ bool IIorapImpl::Start(std::shared_ptr<manager::EventManager> event_manager) {
 
   ::android::FdPrinter printer{fd};
 
-  impl_->Dump(printer);
+  impl_->Dump(printer, args);
 
   return ::android::NO_ERROR;
 }
@@ -351,6 +432,23 @@ Status SendArgs(const char* function_name,
     //
     // Most of the work here is done async, so it should handle
     // async callbacks.
+    return Status::fromStatusT(::android::BAD_VALUE);
+  }
+}
+
+template <typename ... Args>
+Status SendArgs(const char* function_name,
+                Impl* self,
+                const RequestId& request_id,
+                const DexOptEvent& event) {
+  DCHECK_EQ(std::string(function_name), "onDexOptEvent");
+  LOG(VERBOSE) << "IIorap::onDexOptEvent";
+
+  MAYBE_HAVE_FAKE_BEHAVIOR(self, request_id);
+
+  if (self->OnDexOptEvent(request_id, event)) {
+    return Status::ok();
+  } else {
     return Status::fromStatusT(::android::BAD_VALUE);
   }
 }

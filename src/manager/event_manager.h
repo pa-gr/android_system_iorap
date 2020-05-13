@@ -18,6 +18,7 @@
 #define IORAP_MANAGER_EVENT_MANAGER_H_
 
 #include "binder/app_launch_event.h"
+#include "binder/dexopt_event.h"
 #include "binder/job_scheduled_event.h"
 #include "binder/request_id.h"
 #include "binder/task_result.h"
@@ -73,6 +74,13 @@ class EventManager {
   bool OnAppLaunchEvent(binder::RequestId request_id,
                         const binder::AppLaunchEvent& event);
 
+  // Handles a DexOptEvent:
+  //
+  // Clean up the invalidate traces after package is updated by dexopt.
+  bool OnDexOptEvent(binder::RequestId request_id,
+                     const binder::DexOptEvent& event);
+
+
   // Handles a JobScheduledEvent:
   //
   // * Start/stop background jobs (typically for idle maintenance).
@@ -88,6 +96,18 @@ class EventManager {
 
   // Print to adb shell dumpsys (for bugreport info).
   void Dump(/*borrow*/::android::Printer& printer);
+
+  // A dumpsys --refresh-properties command signaling that we should
+  // refresh our system properties.
+  void RefreshSystemProperties(::android::Printer& printer);
+
+  // A dumpsys --purge-package <name> command signaling
+  // that all db rows and files associated with a package should be deleted.
+  bool PurgePackage(::android::Printer& printer, const std::string& package_name);
+
+  // A dumpsys --compile-package <name> command signaling
+  // that a package should be recompiled.
+  bool CompilePackage(::android::Printer& printer, const std::string& package_name);
 
   class Impl;
  private:
