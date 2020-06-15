@@ -228,18 +228,23 @@ struct AppLaunchEventState {
         history_id_observable.connect();
 
         DCHECK(!IsTracing());
+
+        // The time should be set before perfetto tracing.
+        // Record the timestamp even no perfetto tracing is triggered,
+        // because the tracing may start in the following ActivityLaunched
+        // event. Otherwise, there will be no starting timestamp and
+        // trace without starting timestamp is not considered for compilation.
+        if (event.timestamp_nanos >= 0) {
+          intent_started_ns_ = event.timestamp_nanos;
+        } else {
+          LOG(WARNING) << "Negative event timestamp: " << event.timestamp_nanos;
+        }
+
         // Optimistically start tracing if we have the activity in the intent.
         if (!event.intent_proto->has_component()) {
           // Can't do anything if there is no component in the proto.
           LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: no component, can't trace";
           break;
-        }
-
-        // The time should be set before perfetto tracing.
-        if (event.timestamp_nanos >= 0) {
-          intent_started_ns_ = event.timestamp_nanos;
-        } else {
-          LOG(WARNING) << "Negative event timestamp: " << event.timestamp_nanos;
         }
 
         if (allowed_readahead_) {
@@ -297,7 +302,7 @@ struct AppLaunchEventState {
 
           AbortTrace();
           AbortReadAhead();
-        } else if (!IsTracing() || !IsReadAhead()) {  // and the temperature is Cold.
+        } else if (!IsTracing() && !IsReadAhead()) {  // and the temperature is Cold.
           // Start late trace when intent didn't have a component name
           LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent need to start new trace";
 
@@ -383,10 +388,15 @@ struct AppLaunchEventState {
     // Firstly, try to find the compiled trace from sqlite.
     android::base::Timer timer{};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
-    int version = version_map_->GetOrQueryPackageVersion(component_name.package);
+    std::optional<int> version =
+        version_map_->GetOrQueryPackageVersion(component_name.package);
+    if (!version) {
+      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
+      return std::nullopt;
+    }
     db::VersionedComponentName vcn{component_name.package,
                                    component_name.activity_name,
-                                   version};
+                                   *version};
 
     std::optional<db::PrefetchFileModel> compiled_trace =
           db::PrefetchFileModel::SelectByVersionedComponentName(db, vcn);
@@ -460,7 +470,8 @@ struct AppLaunchEventState {
     return is_tracing_;
   }
 
-  rxcpp::composite_subscription StartTracing(AppComponentName component_name) {
+  std::optional<rxcpp::composite_subscription> StartTracing(
+      AppComponentName component_name) {
     DCHECK(allowed_tracing_);
     DCHECK(!IsTracing());
 
@@ -498,10 +509,15 @@ struct AppLaunchEventState {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (2)";
            });
 
-    int version = version_map_->GetOrQueryPackageVersion(component_name_->package);
+    std::optional<int> version =
+        version_map_->GetOrQueryPackageVersion(component_name_->package);
+    if (!version) {
+      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
+      return std::nullopt;
+    }
     db::VersionedComponentName versioned_component_name{component_name.package,
                                                         component_name.activity_name,
-                                                        version};
+                                                        *version};
     lifetime = RxAsync::SubscribeAsync(*async_pool_,
         std::move(stream_via_threads),
         /*on_next*/[versioned_component_name]
@@ -599,6 +615,7 @@ struct AppLaunchEventState {
       LOG(VERBOSE) << "AppLaunchEventState - MarkPendingTrace - lifetime was empty";
     }
 
+    is_tracing_ = false;
     // FIXME: how do we clear this vector?
   }
 
@@ -642,11 +659,16 @@ struct AppLaunchEventState {
 
     using namespace iorap::db;
 
-    int version = version_map_->GetOrQueryPackageVersion(component_name_->package);
+    std::optional<int> version =
+        version_map_->GetOrQueryPackageVersion(component_name_->package);
+    if (!version) {
+      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
+      return std::nullopt;
+    }
     std::optional<ActivityModel> activity =
         ActivityModel::SelectOrInsert(db,
                                       component_name_->package,
-                                      version,
+                                      *version,
                                       component_name_->activity_name);
 
     if (!activity) {
@@ -1220,7 +1242,7 @@ class EventManager::Impl {
     printer.printFormatLine("iorapd.readahead.enable = %s", s_readahead_allowed ? "true" : "false");
 
     s_min_traces =
-        ::android::base::GetUintProperty<uint64_t>("iorapd.maintenance.min_traces", /*default*/3);
+        ::android::base::GetUintProperty<uint64_t>("iorapd.maintenance.min_traces", /*default*/1);
     uint64_t min_traces = s_min_traces;
     printer.printFormatLine("iorapd.maintenance.min_traces = %" PRIu64, min_traces);
 
